@@ -1,0 +1,433 @@
+from fastapi import FastAPI, HTTPException, File, Form, UploadFile
+from pydantic import BaseModel
+import json
+import uuid
+import os
+from langchain_aws import BedrockEmbeddings
+from dotenv import load_dotenv
+from fastapi.middleware.cors import CORSMiddleware
+import bcrypt
+
+from langchain_aws import ChatBedrock
+from langchain_chroma import Chroma
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
+from langchain_openai import ChatOpenAI
+from langchain_core.documents import Document
+
+from File_Class import PrepareFile 
+from docExtract import extract_text_from_file
+
+from sqlalchemy import Column, Integer, String, create_engine, ForeignKey, Text
+from sqlalchemy.orm import Mapped, sessionmaker, mapped_column, declarative_base, relationship
+
+from mainDB_test import Rag
+
+load_dotenv()
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], 
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+BASE_DIR = "rag_data"
+CHROMA_DIR = "./chroma_data" 
+
+#  Old db management
+# //////////////////
+# users_db = {}
+# rag_db = {}
+# /////////////////
+
+
+## SQLALCHEMY DB SETUP
+Base = declarative_base()
+engine = create_engine("sqlite:///RAG_MAKER.db")
+SessionLocal = sessionmaker(bind=engine)
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    user_id: Mapped[str] = mapped_column(String, primary_key=True)
+    username: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    password: Mapped[str] = mapped_column(String, nullable=False)
+
+    # relationships
+    rags = relationship("Rag_Table", back_populates="user")
+
+    def __repr__(self):
+        return f"<User(user_id={self.user_id}, username='{self.username}')>"
+
+def insert_user(user_id: str, username: str, password: str):
+    session = SessionLocal()
+    user = User(user_id=user_id, username=username, password=password)
+    session.add(user)
+    session.commit()
+    session.refresh(user)   
+    session.close()
+    return user
+
+def user_exists(username: str):
+    session = SessionLocal()
+    exists = session.query(User).filter(User.username == username).first() is not None
+    session.close()
+    return exists
+
+def find_use_username(username: str):
+    session = SessionLocal()
+    user = session.query(User).filter(User.username == username).first()
+    session.close()
+    return user
+
+def get_user_data(username: str):
+    if user_exists(username):
+        user = find_use_username(username)
+        return {
+        "user_id": user.user_id,
+        "username": user.username,
+        "password": user.password,
+    }
+    else:
+        return None
+def user_id_exists(user_id: str) -> bool:
+    session = SessionLocal()
+    user = session.query(User).filter(User.user_id == user_id).first() is not None
+    session.close()
+    return user
+
+
+
+class Rag_Table(Base):
+    __tablename__ = "rag_table"
+
+    rag_id: Mapped[str] = mapped_column(primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.user_id"), nullable=False)
+    rag_name: Mapped[str] = mapped_column(String, nullable=False)
+    model: Mapped[str] = mapped_column(String, nullable=False)
+    key: Mapped[str] = mapped_column(String, nullable=False)
+    documents: Mapped[str] = mapped_column(Text)
+
+
+    # RELATIONSHIP 
+    user = relationship("User", back_populates="rags")
+
+    def __repr__(self):
+        return f"<Rag_Table(rag_id={self.rag_id}, rag_name='{self.rag_name}')>"
+    
+def insert_rag(rag_id: str, user_id: str, rag_name: str, model: str, key: str, documents):
+    session = SessionLocal()
+    rag = Rag_Table(rag_id=rag_id, user_id=user_id, rag_name=rag_name, model=model, key=key, documents=documents)
+    session.add(rag)
+    session.commit()
+    session.refresh(rag)
+    session.close()
+    return rag
+
+def rag_exists(rag_id: str):
+    session = SessionLocal()
+    rag = session.query(Rag_Table).filter(Rag_Table.rag_id == rag_id).first() is not None
+    session.close()
+    return rag
+
+def check_rag_owner(cur_user_id, rag_id: str):
+    with SessionLocal() as session:
+        rag = session.query(Rag_Table).filter(Rag_Table.rag_id == rag_id).first()
+        if rag is None:
+            return False
+        else:
+            return rag.user_id == cur_user_id
+
+def get_rag_json(rag_id: str):
+    session = SessionLocal()
+    if rag_exists(rag_id):
+        rag = session.query(Rag_Table).filter(Rag_Table.rag_id == rag_id).first()
+        session.close()
+        return {
+        "user_id": rag.user_id,
+        "RAG_name": rag.rag_name,
+        "Model": rag.model,
+        "key": rag.key,
+        "documents": rag.documents
+    }
+
+    else:
+        return None
+
+Base.metadata.create_all(engine)
+
+@app.get("/")
+def home():
+    return {"Hello": "World"}
+
+
+class CreateUserRequest(BaseModel):
+    username: str
+    password: str
+
+class CreateUserResponse(BaseModel):
+    Action: str
+    user_id: str
+
+@app.post("/create_user", response_model=CreateUserResponse)
+def create_user_id(request: CreateUserRequest):
+    if user_exists(request.username):
+        raise HTTPException(status_code=400, detail="User already exists")
+
+    readyHash = request.password.encode("utf-8")
+    hash_password = bcrypt.hashpw(readyHash, bcrypt.gensalt()).decode("utf-8")
+
+    user_id = str(uuid.uuid4())
+    insert_user(user_id, request.username, hash_password)
+
+
+    return {"Action": "User Created","user_id": user_id}
+
+
+class CreateRAGResponse(BaseModel):
+    RAG_id: str
+
+@app.post("/{user_id}/create_rag", response_model=CreateRAGResponse)
+async def create_RAG(user_id: str,
+                    RAG_name: str = Form(...),
+                    Model: str = Form(...),
+                    key: str = Form(...),
+                    documents: list[UploadFile] = File(...)):
+    
+    session = SessionLocal()
+    exists = session.query(User).filter(User.user_id == user_id).first() is not None
+    session.close()
+    
+    if not exists:
+        raise HTTPException(status_code=404, detail="User_Id is not found")
+
+
+    
+    rag_id = str(uuid.uuid4())
+    
+    rag_dir = os.path.join(BASE_DIR, user_id, rag_id)
+    os.makedirs(rag_dir, exist_ok=True)
+
+    saved_files = []
+
+    for doc in documents:
+        file_path = os.path.join(rag_dir, doc.filename)
+        with open(file_path, "wb") as f:
+            f.write(await doc.read())
+            saved_files.append(file_path)
+
+    # Create collection name
+    collections_name = f"{user_id}_{rag_id}"
+
+    # Process and save each file to ChromaDB
+    for file in saved_files:
+        prep = PrepareFile(file)
+        docs = prep.load_documents()
+        chunks = prep.doc_splitter(docs)
+        chunks = prep.id_chunks(chunks)
+
+        prep.save_to_chromadb(chunks, collection_name=collections_name, persist_directory=CHROMA_DIR) 
+
+    documents_json = json.dumps(saved_files)
+    
+    # Save metadata to rag_table
+    insert_rag(rag_id, user_id, RAG_name, Model, key, documents_json)
+
+    rag_metadata = {
+        "user_id": user_id,
+        "RAG_name": RAG_name,
+        "Model": Model,
+        "key": key,
+        "documents": saved_files
+    }
+
+    with open(os.path.join(rag_dir, "config.json"), "w") as f:
+        json.dump(rag_metadata, f, indent=2)
+
+    return {"RAG_id": rag_id, "chromadb": collections_name}
+
+
+class RAGQueryRequest(BaseModel):
+    query: str
+
+@app.post("/{user_id}/{RAG_id}/query")
+async def query_rag(user_id: str, 
+                    RAG_id: str, 
+                    request: RAGQueryRequest):
+    
+    if user_id_exists(user_id) == False:
+        raise HTTPException(status_code=404, detail="User_Id is not found")
+    
+    if not rag_exists(RAG_id) or not check_rag_owner(user_id, RAG_id):
+        raise HTTPException(status_code=404, detail="RAG not found or does not belong to user")
+
+    
+    rag_info = get_rag_json(RAG_id)
+
+    chromaDB_collection = f"{user_id}_{RAG_id}"
+
+    query_text = request.query
+    modelChosen = rag_info["Model"]
+
+
+    def get_embedded_function():
+        embedding = BedrockEmbeddings(
+            model_id="amazon.titan-embed-text-v2:0",
+            aws_access_key_id=os.getenv("AWS_ACCESS_KEY"),
+            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+            region_name=os.getenv("AWS_REGION", "us-east-2")
+        )
+        return embedding
+
+    embedding_fn = get_embedded_function()
+
+    # Connect to ChromaDB with same directory as storage
+    db = Chroma(
+        collection_name=chromaDB_collection,
+        embedding_function=embedding_fn,
+        persist_directory=CHROMA_DIR 
+    )
+    
+    retriever = db.as_retriever(search_kwargs={"k": 3})
+
+    # Select model
+    if modelChosen.lower() == "claude":
+        model = ChatBedrock(
+            model="anthropic.claude-3-sonnet-20240229-v1:0",
+            model_kwargs={"temperature": 0.3}
+        )
+    elif modelChosen.lower() == "openai":
+        os.environ["OPENAI_API_KEY"] = rag_info["key"]  
+        model = ChatOpenAI(
+            model="gpt-4o-mini",
+            temperature=0.3
+        )
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported model type")
+
+    # Create prompt template
+    prompt = ChatPromptTemplate.from_template("""
+You are a helpful AI assistant.
+Use the provided context to answer the user's question.
+
+Context:
+{context}
+
+Question: {question}
+
+Answer clearly and rely on documents provided before using external knowledge.
+If the context doesn't contain relevant information, say so.
+""")
+
+    # Build RAG chain
+    chain = (
+        {
+            "context": retriever | (lambda docs: "\n\n".join([d.page_content for d in docs])),
+            "question": RunnablePassthrough()
+        }
+        | prompt
+        | model
+        | StrOutputParser()
+    )
+
+ 
+    docs = retriever.invoke(query_text) 
+    response = chain.invoke(query_text)
+
+    return {
+        "response": response,
+        "model_used": rag_info["Model"],
+        "RAG_name": rag_info["RAG_name"],
+        "documents_retrieved": len(docs) 
+    }
+
+
+@app.post("/{user_id}/{RAG_id}/file_query")
+async def query_rag(
+    user_id: str,
+    RAG_id: str,
+    query: str = Form(...),
+    file: UploadFile = File(None)   
+):
+    
+    if user_id_exists(user_id) == False:
+        raise HTTPException(status_code=404, detail="User_Id is not found")
+    
+    if not rag_exists(RAG_id) or not check_rag_owner(user_id, RAG_id):
+        raise HTTPException(status_code=404, detail="RAG not found or does not belong to user")
+
+    rag_info = get_rag_json(RAG_id)
+    
+    chromaDB_collection = f"{user_id}_{RAG_id}"
+    modelChosen = rag_info["Model"]
+
+    # Load embeddings
+    embedding_fn = BedrockEmbeddings(
+        model_id="amazon.titan-embed-text-v2:0",
+        aws_access_key_id=os.getenv("AWS_ACCESS_KEY"),
+        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+        region_name=os.getenv("AWS_REGION", "us-east-2")
+    )
+
+    # Connect to Chroma vector store
+    db = Chroma(
+        collection_name=chromaDB_collection,
+        embedding_function=embedding_fn,
+        persist_directory=CHROMA_DIR
+    )
+    retriever = db.as_retriever(search_kwargs={"k": 3})
+
+    # optional uploaded file
+    uploaded_document = None
+    if file:
+        uploaded_text = await extract_text_from_file(file)
+        if uploaded_text and uploaded_text.strip():
+            uploaded_document = Document(page_content=uploaded_text)
+
+    docs = retriever.invoke(query)
+
+    
+    if uploaded_document:
+        docs.append(uploaded_document)
+
+    if modelChosen.lower() == "claude":
+        model = ChatBedrock(
+            model="anthropic.claude-3-sonnet-20240229-v1:0",
+            model_kwargs={"temperature": 0.3}
+        )
+    elif modelChosen.lower() == "openai":
+        os.environ["OPENAI_API_KEY"] = rag_info["key"]
+        model = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
+
+    # Prompt
+    prompt = ChatPromptTemplate.from_template("""
+You are a helpful AI assistant.
+Use the provided context to answer the user's question.
+
+Context:
+{context}
+
+Question: {question}
+
+If the context doesn't contain relevant information, say so.
+""")
+
+    combined_context = "\n\n".join([d.page_content for d in docs])
+
+    chain = prompt | model | StrOutputParser()
+    response = chain.invoke({"context": combined_context, "question": query})
+
+    return {
+        "response": response,
+       # "documents_retrieved": len(docs),
+       # "uploaded_doc_included": bool(uploaded_document)
+    }
+
+    
