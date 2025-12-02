@@ -1,3 +1,4 @@
+from lib2to3.pgen2 import token
 from fastapi import FastAPI, HTTPException, File, Form, UploadFile
 from pydantic import BaseModel
 import json
@@ -24,6 +25,9 @@ from sqlalchemy.orm import Mapped, sessionmaker, mapped_column, declarative_base
 
 from mainDB_test import Rag
 
+import jwt
+from datetime import datetime, timedelta
+
 load_dotenv()
 
 app = FastAPI()
@@ -36,15 +40,31 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 BASE_DIR = "rag_data"
 CHROMA_DIR = "./chroma_data" 
 
-#  Old db management
-# //////////////////
-# users_db = {}
-# rag_db = {}
-# /////////////////
+
+## JWT SETUP, MOVE TO ENV FOR PROD AND BEFORE COMMIT
+SECRET_KEY = "ugiKRUo9dp7j8gRJez9zzH6ZmPXzGyfe"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+# JWT Helper Functions 
+def create_access_token(data: dict, expires_delta: timedelta | None = None):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
+    token = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return token
+
+def verify_token(token: str):
+    try:
+        decoded = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return decoded.get("user_id")
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.InvalidTokenError:
+        return None
 
 
 ## SQLALCHEMY DB SETUP
@@ -167,7 +187,7 @@ Base.metadata.create_all(engine)
 def home():
     return {"Hello": "World"}
 
-
+# Pydantic for creating user
 class CreateUserRequest(BaseModel):
     username: str
     password: str
@@ -191,6 +211,29 @@ def create_user_id(request: CreateUserRequest):
     return {"Action": "User Created","user_id": user_id}
 
 
+## Pydantic model for login validation
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class LoginResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+@app.post("/login", response_model=LoginResponse)
+def login(request: LoginRequest):
+    user = find_use_username(request.username)
+    if not user:
+        raise HTTPException(status_code=400, detail="User is not found")
+    
+    if not bcrypt.checkpw(request.password.encode("utf-8"), user.password.encode("utf-8")):
+        raise HTTPException(status_code=400, detail="Invalid Username or Password" )
+    
+    token = create_access_token({"user_id": user.user_id})
+    return {"access_token": token, "token_type": "bearer"}
+
+
+# Pydantic for RAG_ID 
 class CreateRAGResponse(BaseModel):
     RAG_id: str
 
