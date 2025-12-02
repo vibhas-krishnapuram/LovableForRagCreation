@@ -1,5 +1,4 @@
-from lib2to3.pgen2 import token
-from fastapi import FastAPI, HTTPException, File, Form, UploadFile
+from fastapi import FastAPI, HTTPException, File, Form, UploadFile, Depends
 from pydantic import BaseModel
 import json
 import uuid
@@ -7,6 +6,7 @@ import os
 from langchain_aws import BedrockEmbeddings
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer
 import bcrypt
 
 from langchain_aws import ChatBedrock
@@ -45,9 +45,11 @@ CHROMA_DIR = "./chroma_data"
 
 
 ## JWT SETUP, MOVE TO ENV FOR PROD AND BEFORE COMMIT
-SECRET_KEY = "ugiKRUo9dp7j8gRJez9zzH6ZmPXzGyfe"
+SECRET_KEY = os.getenv("JWT_SECRET")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 # JWT Helper Functions 
 def create_access_token(data: dict, expires_delta: timedelta | None = None):
@@ -65,6 +67,12 @@ def verify_token(token: str):
         return None
     except jwt.InvalidTokenError:
         return None
+
+def get_current_user_token(token: str = Depends(oauth2_scheme)):
+    user_id = verify_token(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    return user_id
 
 
 ## SQLALCHEMY DB SETUP
@@ -237,12 +245,14 @@ def login(request: LoginRequest):
 class CreateRAGResponse(BaseModel):
     RAG_id: str
 
-@app.post("/{user_id}/create_rag", response_model=CreateRAGResponse)
-async def create_RAG(user_id: str,
-                    RAG_name: str = Form(...),
+@app.post("/rag/create", response_model=CreateRAGResponse)
+async def create_RAG(RAG_name: str = Form(...),
                     Model: str = Form(...),
                     key: str = Form(...),
-                    documents: list[UploadFile] = File(...)):
+                    documents: list[UploadFile] = File(...),
+                    current_user_id: str = Depends(get_current_user_token)
+                    ):
+    user_id = current_user_id
     
     session = SessionLocal()
     exists = session.query(User).filter(User.user_id == user_id).first() is not None
@@ -300,11 +310,13 @@ async def create_RAG(user_id: str,
 class RAGQueryRequest(BaseModel):
     query: str
 
-@app.post("/{user_id}/{RAG_id}/query")
-async def query_rag(user_id: str, 
-                    RAG_id: str, 
-                    request: RAGQueryRequest):
-    
+@app.post("/rag/{RAG_id}/query")
+async def query_rag(RAG_id: str, 
+                    request: RAGQueryRequest,
+                    current_user_id: str = Depends(get_current_user_token)
+                    ):
+    user_id = current_user_id
+
     if user_id_exists(user_id) == False:
         raise HTTPException(status_code=404, detail="User_Id is not found")
     
@@ -391,14 +403,14 @@ If the context doesn't contain relevant information, say so.
         "documents_retrieved": len(docs) 
     }
 
-
-@app.post("/{user_id}/{RAG_id}/file_query")
-async def query_rag(
-    user_id: str,
+@app.post("/rag/{RAG_id}/file_query")
+async def file_query_rag(
     RAG_id: str,
     query: str = Form(...),
-    file: UploadFile = File(None)   
+    file: UploadFile = File(None),
+    current_user_id: str = Depends(get_current_user_token)
 ):
+    user_id = current_user_id
     
     if user_id_exists(user_id) == False:
         raise HTTPException(status_code=404, detail="User_Id is not found")
