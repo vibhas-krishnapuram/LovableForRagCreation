@@ -53,7 +53,7 @@ SECRET_KEY = os.getenv("JWT_SECRET")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
-#oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+
 oauth2_scheme = HTTPBearer(description="Paste your JWT token prefixed with 'Bearer '")
 
 # JWT Helper Functions 
