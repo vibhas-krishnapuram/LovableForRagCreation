@@ -3,8 +3,9 @@ import os
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
-from langchain_aws import BedrockEmbeddings
 from langchain_chroma import Chroma
+
+from rag_utilities import get_embeddings, get_rag_collection, chroma_client, collection_cache
 
 load_dotenv()
 
@@ -13,10 +14,12 @@ class PrepareFile:
         self.data_path = file
 
     def load_documents(self):
+        """Load documents from a PDF file."""
         document_loader = PyPDFLoader(self.data_path)
         return document_loader.load()
 
     def doc_splitter(self, documents: list[Document]):
+        """Split documents into chunks."""
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=300,
             chunk_overlap=30,
@@ -25,26 +28,18 @@ class PrepareFile:
         )
         return text_splitter.split_documents(documents)
 
-    def get_embedded_function(self):
-        embedding = BedrockEmbeddings(
-            model_id="amazon.titan-embed-text-v2:0",
-            aws_access_key_id=os.getenv("AWS_ACCESS_KEY"),
-            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-            region_name=os.getenv("AWS_REGION", "us-east-2")
-        )
-        return embedding
-    
     def id_chunks(self, chunks):
+        """Assign unique IDs to chunks."""
         for i, chunk in enumerate(chunks):
             source = os.path.basename(chunk.metadata.get("source", "unknown"))
             page = chunk.metadata.get("page", 0)
             chunk_id = f"{source}_page{page}_chunk{i}"
             chunk.metadata["id"] = chunk_id
         return chunks
-    
+
     def save_to_chromadb(self, chunks, collection_name: str, persist_directory: str = "./chroma_data"):
         """
-        Save chunks to ChromaDB using Bedrock embeddings.
+        Save chunks to ChromaDB using cached embeddings and cached collection.
         
         Args:
             chunks: List of Document chunks with IDs
@@ -52,16 +47,19 @@ class PrepareFile:
             persist_directory: Directory to persist ChromaDB data
         """
 
-        embedding_fn = self.get_embedded_function()
-        
+        # Get cached embedding function
+        embedding_fn = get_embeddings()
 
+        # Get cached collection object
+        _ = get_rag_collection(collection_name)  # ensures collection exists in cache
+
+        # Use Chroma wrapper to add documents with embeddings
         db = Chroma(
+            client=get_rag_collection.collection_cache.get(collection_name) or get_rag_collection(collection_name),
             collection_name=collection_name,
             embedding_function=embedding_fn,
-            persist_directory=persist_directory
         )
-        
 
-        db.add_documents(documents=chunks)
-        
+        db.add_documents(chunks)
+
         print(f"✓ Saved {len(chunks)} chunks to collection '{collection_name}'")

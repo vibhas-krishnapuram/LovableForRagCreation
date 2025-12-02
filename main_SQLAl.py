@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, File, Form, UploadFile
+from fastapi import FastAPI, HTTPException, File, Form, UploadFile, Depends
 from pydantic import BaseModel
 import json
 import uuid
@@ -6,6 +6,7 @@ import os
 from langchain_aws import BedrockEmbeddings
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer, HTTPBearer, HTTPAuthorizationCredentials
 import bcrypt
 
 from langchain_aws import ChatBedrock
@@ -24,6 +25,12 @@ from sqlalchemy.orm import Mapped, sessionmaker, mapped_column, declarative_base
 
 from mainDB_test import Rag
 
+import jwt
+from datetime import datetime, timedelta, timezone
+
+
+from rag_utilities import get_embeddings, get_rag_collection, chroma_client, collection_cache, get_cached_db, db_cache
+
 load_dotenv()
 
 app = FastAPI()
@@ -36,15 +43,52 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 BASE_DIR = "rag_data"
 CHROMA_DIR = "./chroma_data" 
 
-#  Old db management
-# //////////////////
-# users_db = {}
-# rag_db = {}
-# /////////////////
+
+
+## JWT SETUP, MOVE TO ENV FOR PROD AND BEFORE COMMIT
+SECRET_KEY = "test"
+#SECRET_KEY = os.getenv("JWT_SECRET")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+#oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+oauth2_scheme = HTTPBearer(description="Paste your JWT token prefixed with 'Bearer '")
+
+# JWT Helper Functions 
+def create_access_token(data: dict, expires_delta: timedelta | None = None):
+    to_encode = data.copy()
+    # Use timezone-aware datetime
+    expire = datetime.now(timezone.utc) + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
+    token = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return token
+
+def verify_token(token: str):
+    try:
+        decoded = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return decoded.get("user_id")
+    except jwt.ExpiredSignatureError:
+        print("Token has expired")  # Debug logging
+        return None
+    except jwt.InvalidTokenError as e:
+        print(f"Invalid token: {e}")  # Debug logging
+        return None
+
+
+def get_current_user_token(credentials: HTTPAuthorizationCredentials = Depends(oauth2_scheme)):
+    # Extract the token string from the credentials object
+    token_string = credentials.credentials
+    user_id = verify_token(token_string)
+    if not user_id:
+        # This exception detail is critical for debugging
+        raise HTTPException(
+            status_code=401, 
+            detail="Invalid or expired token. Check server logs for details."
+        )
+    return user_id
 
 
 ## SQLALCHEMY DB SETUP
@@ -167,7 +211,7 @@ Base.metadata.create_all(engine)
 def home():
     return {"Hello": "World"}
 
-
+# Pydantic for creating user
 class CreateUserRequest(BaseModel):
     username: str
     password: str
@@ -191,15 +235,40 @@ def create_user_id(request: CreateUserRequest):
     return {"Action": "User Created","user_id": user_id}
 
 
+## Pydantic model for login validation
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class LoginResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+@app.post("/login", response_model=LoginResponse)
+def login(request: LoginRequest):
+    user = find_use_username(request.username)
+    if not user:
+        raise HTTPException(status_code=400, detail="User is not found")
+    
+    if not bcrypt.checkpw(request.password.encode("utf-8"), user.password.encode("utf-8")):
+        raise HTTPException(status_code=400, detail="Invalid Username or Password" )
+    
+    token = create_access_token({"user_id": user.user_id})
+    return {"access_token": token, "token_type": "bearer"}
+
+
+# Pydantic for RAG_ID 
 class CreateRAGResponse(BaseModel):
     RAG_id: str
 
-@app.post("/{user_id}/create_rag", response_model=CreateRAGResponse)
-async def create_RAG(user_id: str,
-                    RAG_name: str = Form(...),
+@app.post("/rag/create", response_model=CreateRAGResponse)
+async def create_RAG(RAG_name: str = Form(...),
                     Model: str = Form(...),
                     key: str = Form(...),
-                    documents: list[UploadFile] = File(...)):
+                    documents: list[UploadFile] = File(...),
+                    current_user_id: str = Depends(get_current_user_token)
+                    ):
+    user_id = current_user_id
     
     session = SessionLocal()
     exists = session.query(User).filter(User.user_id == user_id).first() is not None
@@ -257,62 +326,50 @@ async def create_RAG(user_id: str,
 class RAGQueryRequest(BaseModel):
     query: str
 
-@app.post("/{user_id}/{RAG_id}/query")
-async def query_rag(user_id: str, 
-                    RAG_id: str, 
-                    request: RAGQueryRequest):
+@app.post("/rag/{RAG_id}/query")
+async def query_rag(
+    RAG_id: str,
+    request: RAGQueryRequest,
+    current_user_id: str = Depends(get_current_user_token),
+):
+    import time
+    start_time = time.time()
     
-    if user_id_exists(user_id) == False:
+    user_id = current_user_id
+
+    if not user_id_exists(user_id):
         raise HTTPException(status_code=404, detail="User_Id is not found")
-    
+
     if not rag_exists(RAG_id) or not check_rag_owner(user_id, RAG_id):
         raise HTTPException(status_code=404, detail="RAG not found or does not belong to user")
 
-    
     rag_info = get_rag_json(RAG_id)
-
-    chromaDB_collection = f"{user_id}_{RAG_id}"
-
     query_text = request.query
     modelChosen = rag_info["Model"]
 
+    collection_name = f"{user_id}_{RAG_id}"
 
-    def get_embedded_function():
-        embedding = BedrockEmbeddings(
-            model_id="amazon.titan-embed-text-v2:0",
-            aws_access_key_id=os.getenv("AWS_ACCESS_KEY"),
-            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-            region_name=os.getenv("AWS_REGION", "us-east-2")
-        )
-        return embedding
-
-    embedding_fn = get_embedded_function()
-
-    # Connect to ChromaDB with same directory as storage
-    db = Chroma(
-        collection_name=chromaDB_collection,
-        embedding_function=embedding_fn,
-        persist_directory=CHROMA_DIR 
-    )
-    
+    # Use cached DB instance
+    db = get_cached_db(collection_name)
     retriever = db.as_retriever(search_kwargs={"k": 3})
+    
+    retrieval_start = time.time()
+    docs = retriever.invoke(query_text)
+    retrieval_time = time.time() - retrieval_start
 
     # Select model
     if modelChosen.lower() == "claude":
         model = ChatBedrock(
             model="anthropic.claude-3-sonnet-20240229-v1:0",
-            model_kwargs={"temperature": 0.3}
+            model_kwargs={"temperature": 0.3},
         )
     elif modelChosen.lower() == "openai":
-        os.environ["OPENAI_API_KEY"] = rag_info["key"]  
-        model = ChatOpenAI(
-            model="gpt-4o-mini",
-            temperature=0.3
-        )
+        os.environ["OPENAI_API_KEY"] = rag_info["key"]
+        model = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
     else:
         raise HTTPException(status_code=400, detail="Unsupported model type")
 
-    # Create prompt template
+    # Create prompt
     prompt = ChatPromptTemplate.from_template("""
 You are a helpful AI assistant.
 Use the provided context to answer the user's question.
@@ -320,93 +377,103 @@ Use the provided context to answer the user's question.
 Context:
 {context}
 
-Question: {question}
+Question:
+{question}
 
-Answer clearly and rely on documents provided before using external knowledge.
+Answer clearly and rely on the documents provided before using external knowledge.
 If the context doesn't contain relevant information, say so.
 """)
 
-    # Build RAG chain
+    # RAG chain
     chain = (
         {
             "context": retriever | (lambda docs: "\n\n".join([d.page_content for d in docs])),
-            "question": RunnablePassthrough()
+            "question": RunnablePassthrough(),
         }
         | prompt
         | model
         | StrOutputParser()
     )
 
- 
-    docs = retriever.invoke(query_text) 
+    llm_start = time.time()
     response = chain.invoke(query_text)
+    llm_time = time.time() - llm_start
+    
+    total_time = time.time() - start_time
 
     return {
         "response": response,
         "model_used": rag_info["Model"],
         "RAG_name": rag_info["RAG_name"],
-        "documents_retrieved": len(docs) 
+        "documents_retrieved": len(docs),
+        "performance": {
+            "retrieval_time": f"{retrieval_time:.2f}s",
+            "llm_time": f"{llm_time:.2f}s",
+            "total_time": f"{total_time:.2f}s"
+        }
     }
 
-
-@app.post("/{user_id}/{RAG_id}/file_query")
-async def query_rag(
-    user_id: str,
+@app.post("/rag/{RAG_id}/file_query")
+async def file_query_rag(
     RAG_id: str,
     query: str = Form(...),
-    file: UploadFile = File(None)   
+    file: UploadFile = File(None),
+    current_user_id: str = Depends(get_current_user_token),
 ):
-    
-    if user_id_exists(user_id) == False:
+    user_id = current_user_id
+
+
+    if not user_id_exists(user_id):
         raise HTTPException(status_code=404, detail="User_Id is not found")
-    
+
     if not rag_exists(RAG_id) or not check_rag_owner(user_id, RAG_id):
         raise HTTPException(status_code=404, detail="RAG not found or does not belong to user")
 
     rag_info = get_rag_json(RAG_id)
-    
-    chromaDB_collection = f"{user_id}_{RAG_id}"
     modelChosen = rag_info["Model"]
 
-    # Load embeddings
-    embedding_fn = BedrockEmbeddings(
-        model_id="amazon.titan-embed-text-v2:0",
-        aws_access_key_id=os.getenv("AWS_ACCESS_KEY"),
-        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-        region_name=os.getenv("AWS_REGION", "us-east-2")
+
+    collection_name = f"{user_id}_{RAG_id}"
+
+    embeddings = get_embeddings()
+
+    collection = get_rag_collection(collection_name)
+
+    # Connect to Chroma wrapper using SAME client + collection name
+    db = Chroma(
+        client=chroma_client,
+        collection_name=collection_name,
+        embedding_function=embeddings,
     )
 
-    # Connect to Chroma vector store
-    db = Chroma(
-        collection_name=chromaDB_collection,
-        embedding_function=embedding_fn,
-        persist_directory=CHROMA_DIR
-    )
     retriever = db.as_retriever(search_kwargs={"k": 3})
 
-    # optional uploaded file
+
+    docs = retriever.invoke(query)
+
+
     uploaded_document = None
     if file:
         uploaded_text = await extract_text_from_file(file)
         if uploaded_text and uploaded_text.strip():
             uploaded_document = Document(page_content=uploaded_text)
+            docs.append(uploaded_document)
 
-    docs = retriever.invoke(query)
-
-    
-    if uploaded_document:
-        docs.append(uploaded_document)
-
+   
     if modelChosen.lower() == "claude":
         model = ChatBedrock(
             model="anthropic.claude-3-sonnet-20240229-v1:0",
-            model_kwargs={"temperature": 0.3}
+            model_kwargs={"temperature": 0.3},
         )
     elif modelChosen.lower() == "openai":
         os.environ["OPENAI_API_KEY"] = rag_info["key"]
-        model = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
+        model = ChatOpenAI(
+            model="gpt-4o-mini",
+            temperature=0.3,
+        )
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported model type")
 
-    # Prompt
     prompt = ChatPromptTemplate.from_template("""
 You are a helpful AI assistant.
 Use the provided context to answer the user's question.
@@ -414,20 +481,21 @@ Use the provided context to answer the user's question.
 Context:
 {context}
 
-Question: {question}
+Question:
+{question}
 
 If the context doesn't contain relevant information, say so.
 """)
 
     combined_context = "\n\n".join([d.page_content for d in docs])
 
+
     chain = prompt | model | StrOutputParser()
     response = chain.invoke({"context": combined_context, "question": query})
 
     return {
         "response": response,
-       # "documents_retrieved": len(docs),
-       # "uploaded_doc_included": bool(uploaded_document)
+        "documents_retrieved": len(docs),
+        "uploaded_doc_included": bool(uploaded_document),
     }
 
-    
