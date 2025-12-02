@@ -6,7 +6,7 @@ import os
 from langchain_aws import BedrockEmbeddings
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordBearer
+from fastapi.security import OAuth2PasswordBearer, HTTPBearer, HTTPAuthorizationCredentials
 import bcrypt
 
 from langchain_aws import ChatBedrock
@@ -26,10 +26,10 @@ from sqlalchemy.orm import Mapped, sessionmaker, mapped_column, declarative_base
 from mainDB_test import Rag
 
 import jwt
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
-from functools import lru_cache
-from chromadb import PersistentClient
+
+from rag_utilities import get_embeddings, get_rag_collection, chroma_client, collection_cache, get_cached_db, db_cache
 
 load_dotenv()
 
@@ -47,41 +47,21 @@ BASE_DIR = "rag_data"
 CHROMA_DIR = "./chroma_data" 
 
 
-#LRU cache for Global Embedding
-@lru_cache()
-def get_embeddings():
-    return BedrockEmbeddings(
-        model_id="amazon.titan-embed-text-v2:0",
-        region_name="us-east-2",
-    )
-chroma_client = PersistentClient(path=CHROMA_DIR)
-
-collection_cache = {}
-
-def get_rag_collection(rag_id: str):
-    if rag_id in collection_cache:
-        return collection_cache[rag_id]
-    
-    collection = chroma_client.get_or_create_collection(
-        name=rag_id,
-        metadata={"hnsw:space": "cosine"},
-    )
-
-    collection_cache[rag_id] = collection
-    return collection
-
 
 ## JWT SETUP, MOVE TO ENV FOR PROD AND BEFORE COMMIT
-SECRET_KEY = os.getenv("JWT_SECRET")
+SECRET_KEY = "test"
+#SECRET_KEY = os.getenv("JWT_SECRET")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+#oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+oauth2_scheme = HTTPBearer(description="Paste your JWT token prefixed with 'Bearer '")
 
 # JWT Helper Functions 
 def create_access_token(data: dict, expires_delta: timedelta | None = None):
     to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    # Use timezone-aware datetime
+    expire = datetime.now(timezone.utc) + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     to_encode.update({"exp": expire})
     token = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return token
@@ -91,14 +71,23 @@ def verify_token(token: str):
         decoded = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         return decoded.get("user_id")
     except jwt.ExpiredSignatureError:
+        print("Token has expired")  # Debug logging
         return None
-    except jwt.InvalidTokenError:
+    except jwt.InvalidTokenError as e:
+        print(f"Invalid token: {e}")  # Debug logging
         return None
 
-def get_current_user_token(token: str = Depends(oauth2_scheme)):
-    user_id = verify_token(token)
+
+def get_current_user_token(credentials: HTTPAuthorizationCredentials = Depends(oauth2_scheme)):
+    # Extract the token string from the credentials object
+    token_string = credentials.credentials
+    user_id = verify_token(token_string)
     if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
+        # This exception detail is critical for debugging
+        raise HTTPException(
+            status_code=401, 
+            detail="Invalid or expired token. Check server logs for details."
+        )
     return user_id
 
 
@@ -343,6 +332,9 @@ async def query_rag(
     request: RAGQueryRequest,
     current_user_id: str = Depends(get_current_user_token),
 ):
+    import time
+    start_time = time.time()
+    
     user_id = current_user_id
 
     if not user_id_exists(user_id):
@@ -357,17 +349,13 @@ async def query_rag(
 
     collection_name = f"{user_id}_{RAG_id}"
 
-    embeddings = get_embeddings()
-    db = Chroma(
-        client=chroma_client,
-        collection_name=collection_name,
-        embedding_function=embeddings
-    )
-
-    retriever = db.as_retriever(search_kwargs={"k": 3}
-    )
-
-    #retriever = db.as_retriever(search_kwargs={"k": 3})
+    # Use cached DB instance
+    db = get_cached_db(collection_name)
+    retriever = db.as_retriever(search_kwargs={"k": 3})
+    
+    retrieval_start = time.time()
+    docs = retriever.invoke(query_text)
+    retrieval_time = time.time() - retrieval_start
 
     # Select model
     if modelChosen.lower() == "claude":
@@ -407,19 +395,23 @@ If the context doesn't contain relevant information, say so.
         | StrOutputParser()
     )
 
-
-    docs = retriever.invoke(query_text)
-
-    # run chain
+    llm_start = time.time()
     response = chain.invoke(query_text)
+    llm_time = time.time() - llm_start
+    
+    total_time = time.time() - start_time
 
     return {
         "response": response,
         "model_used": rag_info["Model"],
         "RAG_name": rag_info["RAG_name"],
         "documents_retrieved": len(docs),
+        "performance": {
+            "retrieval_time": f"{retrieval_time:.2f}s",
+            "llm_time": f"{llm_time:.2f}s",
+            "total_time": f"{total_time:.2f}s"
+        }
     }
-
 
 @app.post("/rag/{RAG_id}/file_query")
 async def file_query_rag(

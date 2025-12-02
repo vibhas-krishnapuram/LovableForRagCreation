@@ -5,7 +5,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 from langchain_chroma import Chroma
 
-from main_SQLAl import get_embeddings, get_rag_collection
+from rag_utilities import get_embeddings, get_rag_collection, chroma_client, collection_cache
 
 load_dotenv()
 
