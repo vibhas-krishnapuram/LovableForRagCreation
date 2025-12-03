@@ -507,13 +507,8 @@ async def file_query_rag(
 
     collection = get_rag_collection(collection_name)
 
-    # Connect to Chroma wrapper using SAME client + collection name
-    db = Chroma(
-        client=chroma_client,
-        collection_name=collection_name,
-        embedding_function=embeddings,
-    )
 
+    db = get_cached_db(collection_name)
     retriever = db.as_retriever(search_kwargs={"k": 3})
 
 
