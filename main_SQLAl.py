@@ -1,3 +1,4 @@
+import shutil
 from fastapi import FastAPI, HTTPException, File, Form, UploadFile, Depends
 from pydantic import BaseModel
 import json
@@ -186,7 +187,48 @@ class Rag_Table(Base):
 
     def __repr__(self):
         return f"<Rag_Table(rag_id={self.rag_id}, rag_name='{self.rag_name}')>"
+
+def delete_rag_by_id(user_id: str, rag_id: str):
+    collection_name = f"{user_id}_{rag_id}"
+    rag_dir = os.path.join(BASE_DIR, user_id, rag_id)
+    chroma_path = os.path.join(CHROMA_DIR, collection_name)
+
+    # Delete from DB
+    with SessionLocal() as session:
+        rag_to_delete = session.query(Rag_Table).filter(
+            Rag_Table.rag_id == rag_id,
+            Rag_Table.user_id == user_id
+        ).first()
+
+        if rag_to_delete:
+            session.delete(rag_to_delete)
+            session.commit()
+            db_deleted = True 
+        else:
+            db_deleted = False
+
+    # Delete from Filesystem
+    if os.path.exists(rag_dir):
+        shutil.rmtree(rag_dir)
+
+        # debug statement
+        print(f"Deleted user RAG data directory: {rag_dir}")
+        files_deleted = True 
+    else:
+        files_deleted = False 
     
+    #Delete Chroma Dir
+    if os.path.exists(chroma_path):
+        shutil.rmtree(chroma_path)
+
+        #debug statement
+        print(f"Deleted Chroma collection directory: {chroma_path}")
+        chroma_deleted = True
+    else:
+        chroma_deleted = False
+
+    return db_deleted, files_deleted, chroma_deleted
+
 def insert_rag(rag_id: str, user_id: str, rag_name: str, model: str, key: str, documents):
     session = SessionLocal()
     rag = Rag_Table(rag_id=rag_id, user_id=user_id, rag_name=rag_name, model=model, key=key, documents=documents)
@@ -225,6 +267,7 @@ def get_rag_json(rag_id: str):
 
     else:
         return None
+
 
 Base.metadata.create_all(engine)
 
@@ -444,7 +487,7 @@ async def file_query_rag(
     query: str = Form(...),
     file: UploadFile = File(None),
     current_user_id: str = Depends(get_current_user_token),
-):
+    ):
     user_id = current_user_id
 
 
@@ -525,3 +568,39 @@ If the context doesn't contain relevant information, say so.
         "uploaded_doc_included": bool(uploaded_document),
     }
 
+class RagListItem(BaseModel):
+    rag_id: str
+    rag_name: str 
+    model: str 
+
+@app.get("/rag/list", response_model=list[RagListItem])
+def get_all_rag(
+    current_user_id: str = Depends(get_current_user_token)
+    ):
+    user_id = current_user_id
+
+    with SessionLocal() as session:
+        rags = session.query(Rag_Table).filter(Rag_Table.user_id == user_id).all()
+    
+    return [
+            {"rag_id": r.rag_id, "rag_name": r.rag_name, "model": r.model}
+            for r in rags
+        ]
+
+
+@app.delete("/rag/delete/{rag_id}", status_code=204)
+def delete_rag(rag_id: str,
+                current_user_id: str = Depends(get_current_user_token)
+            ):
+    user_id = current_user_id
+
+    if not check_rag_owner(user_id, rag_id):
+        raise HTTPException(status_code=404, detail="RAG not found or does not belong to user")
+    
+    db_deleted, files_deleted, chroma_deleted = delete_rag_by_id(user_id, rag_id)
+
+    if not db_deleted and not files_deleted and not chroma_deleted:
+        raise HTTPException(status_code=404, detail="RAG not found")
+
+    return 
+      
