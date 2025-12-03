@@ -51,8 +51,6 @@ The end goal is to provide a complete platform where users can:
 ## Roadmap / TODO
 
 ### Backend Improvements
-- Add RAG deletion endpoint
-- Add RAG listing endpoint (get all user's RAGs)
 - Support for more file formats (CSV, Excel, Markdown)
 - Implement rate limiting
 - Add conversation history/memory
@@ -115,6 +113,5 @@ This is an active development project. Contributions, ideas, and feedback are we
 ## Notes
 
 - Currently optimized for development/testing
-- Password verification temporarily disabled for easy testing
 - Moving toward production-ready architecture
 - Performance improvements being implemented (caching, connection pooling)
