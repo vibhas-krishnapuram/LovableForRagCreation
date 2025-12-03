@@ -23,10 +23,12 @@ from docExtract import extract_text_from_file
 from sqlalchemy import Column, Integer, String, create_engine, ForeignKey, Text
 from sqlalchemy.orm import Mapped, sessionmaker, mapped_column, declarative_base, relationship
 
-from mainDB_test import Rag
+from tests.mainDB_test import Rag
 
 import jwt
 from datetime import datetime, timedelta, timezone
+
+from cryptography.fernet import Fernet
 
 
 from rag_utilities import get_embeddings, get_rag_collection, chroma_client, collection_cache, get_cached_db, db_cache
@@ -54,7 +56,7 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
 
-oauth2_scheme = HTTPBearer(description="Paste your JWT token prefixed with 'Bearer '")
+oauth2_scheme = HTTPBearer(description="Paste your JWT token ")
 
 # JWT Helper Functions 
 def create_access_token(data: dict, expires_delta: timedelta | None = None):
@@ -88,6 +90,26 @@ def get_current_user_token(credentials: HTTPAuthorizationCredentials = Depends(o
             detail="Invalid or expired token. Check server logs for details."
         )
     return user_id
+
+
+# ENCRYPTION HELPER FUNCTIONS
+def load_key():
+    return open("secret.key", "rb").read()
+
+def encrypt_key(raw_key: str):
+    key = load_key()
+    f = Fernet(key)
+
+    encoded_key = raw_key.encode()
+    encrypted = f.encrypt(encoded_key)
+
+    return encrypted
+
+def decrypt_key(encrypted_key: str):
+    key = load_key()
+    f = Fernet(key)
+    decrypted = f.decrypt(encrypted_key).decode()
+    return decrypted
 
 
 ## SQLALCHEMY DB SETUP
@@ -304,15 +326,17 @@ async def create_RAG(RAG_name: str = Form(...),
         prep.save_to_chromadb(chunks, collection_name=collections_name, persist_directory=CHROMA_DIR) 
 
     documents_json = json.dumps(saved_files)
-    
+
+    encrypted_key = encrypt_key(key)
+
     # Save metadata to rag_table
-    insert_rag(rag_id, user_id, RAG_name, Model, key, documents_json)
+    insert_rag(rag_id, user_id, RAG_name, Model, encrypted_key, documents_json)
 
     rag_metadata = {
         "user_id": user_id,
         "RAG_name": RAG_name,
         "Model": Model,
-        "key": key,
+        #"key": encrypted_key,
         "documents": saved_files
     }
 
@@ -356,6 +380,8 @@ async def query_rag(
     docs = retriever.invoke(query_text)
     retrieval_time = time.time() - retrieval_start
 
+    decrypted_key = decrypt_key(rag_info["key"])
+
     # Select model
     if modelChosen.lower() == "claude":
         model = ChatBedrock(
@@ -363,7 +389,7 @@ async def query_rag(
             model_kwargs={"temperature": 0.3},
         )
     elif modelChosen.lower() == "openai":
-        os.environ["OPENAI_API_KEY"] = rag_info["key"]
+        os.environ["OPENAI_API_KEY"] = decrypted_key
         model = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
     else:
         raise HTTPException(status_code=400, detail="Unsupported model type")
@@ -458,14 +484,15 @@ async def file_query_rag(
             uploaded_document = Document(page_content=uploaded_text)
             docs.append(uploaded_document)
 
-   
+    decrypted_key = decrypt_key(rag_info["key"])
+
     if modelChosen.lower() == "claude":
         model = ChatBedrock(
             model="anthropic.claude-3-sonnet-20240229-v1:0",
             model_kwargs={"temperature": 0.3},
         )
     elif modelChosen.lower() == "openai":
-        os.environ["OPENAI_API_KEY"] = rag_info["key"]
+        os.environ["OPENAI_API_KEY"] = decrypted_key
         model = ChatOpenAI(
             model="gpt-4o-mini",
             temperature=0.3,
