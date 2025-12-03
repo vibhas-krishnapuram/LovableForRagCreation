@@ -563,6 +563,70 @@ If the context doesn't contain relevant information, say so.
         "uploaded_doc_included": bool(uploaded_document),
     }
 
+@app.post("/rag/{RAG_id}/add_docs")
+async def add_documents_to_rag(
+            RAG_id: str,
+            new_documents: list[UploadFile] = File(...),
+            current_user_id = Depends(get_current_user_token)
+):
+    user_id = current_user_id
+
+    #check token credentials 
+    if not user_id_exists(user_id):
+        raise HTTPException(status_code=404, detail="User_Id is not found")
+
+    if not rag_exists(RAG_id) or not check_rag_owner(user_id, RAG_id):
+        raise HTTPException(status_code=404, detail="RAG not found or does not belong to user")
+    
+    #load metadata
+    rag_info = get_rag_json(RAG_id)
+
+    #save uploaded files to disk
+    rag_dir = os.path.join(BASE_DIR, user_id, RAG_id)
+    os.makedirs(rag_dir, exist_ok=True)
+
+    #adding new files to list
+    new_saved_files = []
+
+    for file in new_documents:
+        save_path = os.path.join(rag_dir, file.filename)
+        with open(save_path, "wb") as f:
+            f.write(await file.read())
+        new_saved_files.append(save_path)
+    
+    #Convert, Chunk, Embed, Save to Chroma
+    collection_name = f"{user_id}_{RAG_id}"
+
+    for file_path in new_saved_files:
+        prep = PrepareFile(file_path)
+        docs = prep.load_documents()
+        chunks = prep.doc_splitter(docs)
+        chunks = prep.id_chunks(chunks)
+
+        #save id chunks to chroma db
+        prep.save_to_chromadb(chunks, collection_name=collection_name, persist_directory=CHROMA_DIR)
+
+
+    #Update RAG DB with new documents and metadata
+    with SessionLocal() as session:
+        rag_row = session.query(Rag_Table).filter(Rag_Table.rag_id == RAG_id).first()
+
+        if rag_row.documents:
+            existing_docs = json.loads(rag_row.documents)
+        else:
+            existing_docs = []
+        updated_docs = list(set(existing_docs + new_saved_files))
+
+        rag_row.documents = json.dumps(updated_docs)
+        session.commit()
+
+    return {
+        "message": "Documents added successfully",
+        "new_documents": new_saved_files,
+        "total_documents": len(updated_docs)
+    } 
+
+
 class RagListItem(BaseModel):
     rag_id: str
     rag_name: str 
