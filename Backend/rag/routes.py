@@ -10,7 +10,7 @@ from schemas.rag_Models import (
 
 from rag.service import *
 
-router = APIRouter(prefix="/rag", tags=["RAG"])
+router = APIRouter(tags=["RAG"])
 
 @router.post("/create", response_model=CreateRAGResponse)
 async def create_RAG_route(RAG_name: str = Form(...),
