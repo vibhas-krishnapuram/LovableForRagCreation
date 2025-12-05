@@ -12,7 +12,7 @@ Base.metadata.create_all(engine)
 setup_cors(app)
 
 app.include_router(auth_router, prefix="/auth")
-app.include_router(rag_router, prefix="/rag")
+
 
 @app.get("/")
 def home():
