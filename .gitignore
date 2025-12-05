@@ -1,0 +1,33 @@
+# Systems
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Javascript/Node
+node_modules/
+dist/
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Database
+*.db
+*.sqlite3
+
+# Logs
+*.log
+
+# Editor
+.vscode/
+.idea/
+
+# Backend Secrets & Data
+Backend/config/secret.key
+Backend/chroma_data/
+Backend/rag_data/
